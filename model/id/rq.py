@@ -29,6 +29,8 @@ class ResidualVectorQuantizer(nn.Module):
         self.letter_mode = letter_mode
         self.sk_epsilons = sk_epsilons or [0.0] * len(codebook_size_list)
         self.sk_iters = sk_iters
+        if len(self.sk_epsilons) != len(codebook_size_list):
+            raise ValueError("Each residual level requires one Sinkhorn epsilon.")
 
         self.vq_layers = nn.ModuleList(
             [
@@ -62,7 +64,7 @@ class ResidualVectorQuantizer(nn.Module):
 
         for quantizer in self.vq_layers:
             indices, probs, quants, losses = quantizer(residual)
-            residual = residual - quants
+            residual = residual - quants.detach()
             quantized = quantized + quants
 
             all_indices.append(indices)
@@ -74,6 +76,8 @@ class ResidualVectorQuantizer(nn.Module):
         soft_probs = torch.stack(all_probs, dim=-1)
         quant_losses = torch.stack(all_losses, dim=-1)
 
+        # Keep one encoder gradient through the complete quantized representation.
+        quantized = x + (quantized - x).detach()
         return hard_indices, soft_probs, quantized, quant_losses
 
     def kmeans_init(self, x, kmeans_iters=10):

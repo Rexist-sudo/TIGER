@@ -12,7 +12,7 @@ class SeqRecDataset(Dataset):
         self.padding_pos = padding_pos
 
         file_path = os.path.join(data_path, dataset, f"{dataset}.inter.json")
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             self.inters = json.load(f)
 
         self.item_num = max((max(v) for v in self.inters.values()), default=0) + 1
@@ -83,3 +83,36 @@ class SeqRecDataset(Dataset):
                 )
 
         return inter_data
+
+
+class SASRecDataset(SeqRecDataset):
+    def _build_data(self, mode):
+        if mode != "train":
+            return super()._build_data(mode)
+        self.train_seen = {}
+        inter_data = []
+        for uid, items in self.inters.items():
+            uid = int(uid)
+            train = [item + 1 for item in items[:-2]]
+            self.train_seen[uid] = set(train)
+            inter_data.append({
+                "his": np.array(self._pad_sequence(train[:-1]), dtype=np.int64),
+                "pos": np.array(self._pad_sequence(train[1:]), dtype=np.int64),
+                "user": uid,
+            })
+        return inter_data
+
+    def __getitem__(self, index):
+        sample = self.inter_data[index]
+        if self.mode != "train":
+            return sample
+        sample = dict(sample)
+        seen = self.train_seen[sample["user"]]
+        negatives = np.zeros(self.max_his_len, dtype=np.int64)
+        for position in np.flatnonzero(sample["pos"]):
+            item = np.random.randint(1, self.item_num + 1)
+            while item in seen:
+                item = np.random.randint(1, self.item_num + 1)
+            negatives[position] = item
+        sample["neg"] = negatives
+        return sample

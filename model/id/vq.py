@@ -52,7 +52,7 @@ class VectorQuantizer(nn.Module):
         codebook = F.mse_loss(quants_hard, x.detach(), reduction="none").mean(-1)
 
         # Optional: diversity loss
-        if self.letter_mode and self.cluster_labeled and self.beta > 0:
+        if self.training and self.letter_mode and self.cluster_labeled and self.beta > 0:
             div_loss = self._diversity_loss(quants_hard, indices, self.cluster_label)
             loss = codebook + self.mu * commitment + self.beta * div_loss
         else:
@@ -98,7 +98,7 @@ class VectorQuantizer(nn.Module):
     # === Clustering & KMeans ===
     def kmeans_init(self, data, n_clusters, kmeans_iters=10):
         assert n_clusters == self.codebook_size
-        centers, _ = self._constrained_kmeans(data, n_clusters, kmeans_iters)
+        centers, _ = self._constrained_kmeans(data, n_clusters, kmeans_iters=kmeans_iters)
         self.embedding.weight.data.copy_(centers)
 
         d2 = self._compute_distances(data, self.embedding.weight)
@@ -138,39 +138,20 @@ class VectorQuantizer(nn.Module):
             n_jobs=10,
             verbose=False,
         )
-        try:
-            clf.fit(x)
-        except Exception:
-            print("KMeans failed, retrying...")
-            clf.fit(x)
+        clf.fit(x)
         return torch.from_numpy(clf.cluster_centers_), clf.labels_.tolist()
 
     # === Diversity Loss ===
     def _diversity_loss(self, x_q, indices, labels):
-        cluster_ids = [labels[idx.item()] for idx in indices]
-        cluster_map = {i: [] for i in set(labels)}
-        for i, lbl in enumerate(labels):
-            cluster_map[lbl].append(i)
-
-        all_candidates, ptr = [], []
-        for i, cid in enumerate(cluster_ids):
-            choices = [j for j in cluster_map[cid] if j != indices[i].item()]
-            choices = choices or [indices[i].item()]
-            start = len(all_candidates)
-            all_candidates.extend(choices)
-            end = len(all_candidates)
-            ptr.append((start, end))
-
-        all_candidates = torch.tensor(all_candidates, device=x_q.device)
-        ptr = torch.tensor(ptr, device=x_q.device)
-        rand_offsets = (
-            torch.rand(len(ptr), device=x_q.device) * (ptr[:, 1] - ptr[:, 0]).float()
-        ).long()
-        sampled_neg = all_candidates[ptr[:, 0] + rand_offsets]
+        labels = torch.tensor(labels, device=indices.device)
+        same_group = labels[:, None].eq(labels[None, :])
+        same_group.fill_diagonal_(False)
+        # Constrained clustering keeps at least ten codes in each group.
+        positives = torch.multinomial(same_group[indices].float(), 1).squeeze(1)
 
         logits = torch.matmul(x_q, self.embedding.weight.t())
         logits.scatter_(1, indices.unsqueeze(1), float("-inf"))
-        return F.cross_entropy(logits, sampled_neg, reduction="none")
+        return F.cross_entropy(logits, positives, reduction="none")
 
     def get_codebook(self):
         return self.embedding.weight

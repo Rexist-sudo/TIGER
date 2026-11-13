@@ -35,21 +35,21 @@ def parse_args():
         description="Train RQVAE for Generative Recommendation"
     )
     parser.add_argument("--seed", type=int, default=1024)
-    parser.add_argument("--gpu_id", type=str, default="1")
+    parser.add_argument("--gpu_id", type=str, default="0")
     parser.add_argument("--optimizer", type=str, default="adamw")
     parser.add_argument("--lr_id", type=float, default=1e-3)
     parser.add_argument("--wd_id", type=float, default=1e-4)
-    parser.add_argument("--max_epochs", type=int, default=20000)
+    parser.add_argument("--max_epochs", type=int, default=3000)
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--data_path", type=str, default="./data/")
-    parser.add_argument("--dataset", type=str, default="Beauty")
+    parser.add_argument("--dataset", type=str, default="Instruments")
     parser.add_argument("--in_dim", type=int, default=4096)
-    parser.add_argument("--codebook_size_list", type=list, default=[256] * 3)
+    parser.add_argument("--codebook_size_list", type=int, nargs="+", default=[256] * 4)
     parser.add_argument("--codebook_dim", type=int, default=32)
-    parser.add_argument("--layers", type=list, default=[2048, 1024, 512, 256, 128, 64])
+    parser.add_argument("--layers", type=int, nargs="+", default=[2048, 1024, 512, 256, 128, 64])
     parser.add_argument("--dropout_prob", type=float, default=0)
     parser.add_argument("--kmeans_iters", type=int, default=10)
-    parser.add_argument("--sk_epsilons", type=eval, default=[0.0, 0.0, 0.0, 0.0])
+    parser.add_argument("--sk_epsilons", type=float, nargs="+", default=[0.0] * 4)
     parser.add_argument(
         "--id_mode", type=str, choices=["tiger", "letter"], default="tiger"
     )
@@ -57,6 +57,7 @@ def parse_args():
     parser.add_argument("--alpha", type=float, default=2e-2)
     parser.add_argument("--beta", type=float, default=1e-4)
     parser.add_argument("--eval_epoch", type=int, default=100)
+    parser.add_argument("--num_workers", type=int, default=0)
     return parser.parse_args()
 
 
@@ -90,8 +91,8 @@ def initialize_model(args, device):
         cf_emb_path=args.cf_emb_path,
         alpha=args.alpha,
         beta=args.beta,
+        sk_epsilons=args.sk_epsilons,
     ).to(device)
-    model.build_indices()
     return model
 
 
@@ -128,7 +129,7 @@ def main():
         IDDataset(num_items),
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
 
@@ -137,25 +138,29 @@ def main():
 
     for epoch in range(args.max_epochs):
         model.train()
+        if args.id_mode == "letter" and args.beta > 0:
+            model.update_cluster_labels()
+        epoch_loss = 0.0
         for batch in dataloader:
             batch = batch.to(device)
             optimizer.zero_grad()
             _, _, loss = model(batch)
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item() * len(batch)
 
-        model.build_indices()
+        print(f"[Epoch {epoch}] RQVAE Loss: {epoch_loss / num_items:.6f}")
 
-        if (epoch + 1) % 1 == 0:
-            print(f"[Epoch {epoch}] RQVAE Loss: {loss.item():.6f}")
-
-        if (epoch + 1) % args.eval_epoch == 0:
+        if (epoch + 1) % args.eval_epoch == 0 or epoch + 1 == args.max_epochs:
             model.eval()
+            model.build_indices()
             with torch.no_grad():
                 uniq_keys, coll_rate = model.get_collision_rate()
+                metrics = model.get_sid_metrics()
             print(
                 f"Epoch {epoch} — Unique Keys: {uniq_keys}, Collision Rate: {coll_rate:.6f}"
             )
+            print("SID Metrics: " + ", ".join(f"{k}={v:.6f}" for k, v in metrics.items()))
             if coll_rate < best_collision_rate:
                 best_collision_rate = coll_rate
                 torch.save(model, ckpt_path)
@@ -163,11 +168,10 @@ def main():
     # save the last epoch
     model.eval()
     model.build_indices()
-    model.update_cluster_labels()
     torch.save(model, ckpt_last_path)
 
     # save the best-collision epoch
-    model = torch.load(ckpt_path)
+    model = torch.load(ckpt_path, weights_only=False, map_location=device)
     model.eval()
     model.build_indices()
     torch.save(model, ckpt_path)

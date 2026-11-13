@@ -5,6 +5,7 @@ import numpy as np
 from .layers import MLPLayers
 from .rq import ResidualVectorQuantizer
 import os
+import json
 from collections import defaultdict
 
 
@@ -69,12 +70,25 @@ class RQVAE(nn.Module):
         )
         self.base_embedding.weight.requires_grad = False
 
-        # Load cf_embedding only once and keep as tensor on CPU
-        if self.letter_mode and cf_emb_path:
+        if self.letter_mode and self.alpha > 0 and not cf_emb_path:
+            raise ValueError("Collaborative alignment requires --cf_emb_path.")
+        self.register_buffer("cf_embedding", None)
+        self.register_buffer("cf_valid", None)
+        self.cf_neighbours = None
+        if cf_emb_path:
             cf_emb_np = np.load(cf_emb_path)
-            self.cf_embedding = torch.from_numpy(cf_emb_np).float()
-        else:
-            self.cf_embedding = None
+            if cf_emb_np.shape != (len(load_weights), codebook_dim):
+                raise ValueError("CF rows and dimensions must match the item catalogue and latent dimension.")
+            self.cf_embedding = torch.cat(
+                [torch.zeros(1, codebook_dim), torch.from_numpy(cf_emb_np).float()]
+            )
+            with open(os.path.join(data_path, dataset, dataset + ".inter.json"), encoding="utf-8") as f:
+                inters = json.load(f)
+            self.cf_valid = torch.zeros(len(load_weights) + 1, dtype=torch.bool)
+            for items in inters.values():
+                self.cf_valid[torch.tensor(items[:-2], dtype=torch.long) + 1] = True
+            exposure_path = os.path.splitext(cf_emb_path)[0] + ".valid.npy"
+            self.cf_valid[1:] &= torch.from_numpy(np.load(exposure_path))
 
         # Cache for generation mapping
         self.all_indices = None  # store the indices of all items without unique suffix
@@ -104,15 +118,10 @@ class RQVAE(nn.Module):
         )
 
         if self.letter_mode and self.alpha > 0 and self.cf_embedding is not None:
-            # Prepare cf_embedding batch
-            cf_embed = torch.cat(
-                [torch.zeros(1, self.codebook_dim), self.cf_embedding], dim=0
-            )
-            cf_embed_batch = cf_embed[x.cpu()].to(x.device)
-
-            cf_loss = self.get_cf_loss(
-                x_q.view(-1, self.codebook_dim),
-                cf_embed_batch.view(-1, self.codebook_dim),
+            valid = self.cf_valid[x]
+            cf_loss = (
+                self.get_cf_loss(x_q[valid], self.cf_embedding[x[valid]])
+                if valid.any() else x_q.sum() * 0
             )
             total_loss = (
                 recon_loss + self.quant_loss_weight * quant_loss + self.alpha * cf_loss
@@ -141,6 +150,8 @@ class RQVAE(nn.Module):
                 )
 
     def build_indices(self):
+        was_training = self.training
+        self.eval()
         with torch.no_grad():
             emb_weight = self.base_embedding.weight.data
             encoded = self.encoder(emb_weight)
@@ -157,6 +168,7 @@ class RQVAE(nn.Module):
             unique_index = len(self.code2item[str_id]) - 1
             self.full_all_indices.append(index + [unique_index])
             self.unique_indices.append(unique_index)
+        self.train(was_training)
 
     def get_collision_rate(self):
         total_items = len(self.all_indices) - 1
@@ -164,3 +176,27 @@ class RQVAE(nn.Module):
         collision_rate = 1 - (unique_items / total_items) if total_items > 0 else 0.0
 
         return unique_items, collision_rate
+
+    @torch.no_grad()
+    def get_sid_metrics(self):
+        _, collision_rate = self.get_collision_rate()
+        metrics = {"sid_unique_rate": 1 - collision_rate}
+        codes = self.all_indices[1:]
+        for level, size in enumerate(self.codebook_size_list):
+            metrics[f"codebook_usage_{level + 1}"] = len(np.unique(codes[:, level])) / size
+        if self.cf_embedding is not None:
+            items = torch.where(self.cf_valid)[0]
+            if self.cf_neighbours is None:
+                cf = F.normalize(self.cf_embedding[items], dim=-1)
+                neighbours = []
+                for start in range(0, len(items), 1024):
+                    scores = cf[start:start + 1024] @ cf.t()
+                    rows = torch.arange(len(scores), device=scores.device)
+                    scores[rows, rows + start] = -torch.inf
+                    neighbours.append(items[scores.argmax(dim=-1)])
+                self.cf_neighbours = torch.cat(neighbours).cpu().numpy()
+            source = items.cpu().numpy()
+            metrics["cf_sid_overlap"] = float(
+                (self.all_indices[source] == self.all_indices[self.cf_neighbours]).mean()
+            )
+        return metrics

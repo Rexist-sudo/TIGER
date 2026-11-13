@@ -60,6 +60,7 @@ class T5Rec(T5ForConditionalGeneration):
         super().__init__(config)
 
         self.temperature = 1.0
+        self.candidate_trie = None
         self.model_dim = config.d_model
 
         # Shared embedding layer
@@ -231,14 +232,15 @@ class T5Rec(T5ForConditionalGeneration):
             all_indices = all_indices.tolist()
 
         # Build trie with start token=0 and end token=1 for candidates
-        candidate_trie = Trie([[0] + candidate + [1] for candidate in all_indices])
-
-        prefix_allowed_tokens = prefix_allowed_tokens_fn(candidate_trie)
+        if self.candidate_trie is None:
+            self.candidate_trie = Trie([[0] + candidate + [1] for candidate in all_indices])
+        code_length = len(all_indices[0])
+        prefix_allowed_tokens = prefix_allowed_tokens_fn(self.candidate_trie)
 
         output = self.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_new_tokens=10,
+            max_new_tokens=code_length + 1,
             prefix_allowed_tokens_fn=prefix_allowed_tokens,
             num_beams=beam_size,
             num_return_sequences=beam_size,
@@ -251,7 +253,7 @@ class T5Rec(T5ForConditionalGeneration):
         output_ids = output["sequences"]
 
         # Remove start and end tokens from generated sequences
-        output_ids = torch.stack([seq[1:-1] for seq in output_ids])
+        output_ids = output_ids[:, 1:code_length + 1]
         output_ids = output_ids.view(batch_size, beam_size, -1)
-
-        return output_ids
+        first_scores = output["scores"][0].view(batch_size, beam_size, -1)[:, 0]
+        return output_ids, first_scores.argmax(dim=-1)
